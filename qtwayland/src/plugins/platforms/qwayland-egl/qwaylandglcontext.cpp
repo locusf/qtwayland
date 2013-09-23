@@ -147,7 +147,6 @@ void QWaylandGLContext::swapBuffers(QPlatformSurface *surface)
         }
 
         glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         static const GLfloat squareVertices[] = {
