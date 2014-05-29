@@ -47,6 +47,7 @@
 #include "wayland_wrapper/qwlsubsurface_p.h"
 #include "wayland_wrapper/qwlcompositor_p.h"
 #include "wayland_wrapper/qwlshellsurface_p.h"
+#include "wayland_wrapper/qwlinputdevice_p.h"
 
 #include "qwaylandcompositor.h"
 #include "waylandwindowmanagerintegration.h"
@@ -56,6 +57,7 @@
 
 #ifdef QT_COMPOSITOR_QUICK
 #include "qwaylandsurfaceitem.h"
+#include <QtQml/QQmlPropertyMap>
 #endif
 
 QT_BEGIN_NAMESPACE
@@ -67,6 +69,7 @@ public:
         : surface(srfc)
 #ifdef QT_COMPOSITOR_QUICK
         , surface_item(0)
+        , windowPropertyMap(new QQmlPropertyMap)
 #endif
     {}
 
@@ -75,18 +78,34 @@ public:
 #ifdef QT_COMPOSITOR_QUICK
         if (surface_item)
             surface_item->setSurface(0);
+        if (windowPropertyMap)
+            windowPropertyMap->deleteLater();
 #endif
     }
 
     QtWayland::Surface *surface;
 #ifdef QT_COMPOSITOR_QUICK
     QWaylandSurfaceItem *surface_item;
+    QQmlPropertyMap *windowPropertyMap;
 #endif
 };
 
 QWaylandSurface::QWaylandSurface(QtWayland::Surface *surface)
     : QObject(*new QWaylandSurfacePrivate(surface))
 {
+#ifdef QT_COMPOSITOR_QUICK
+    Q_D(QWaylandSurface);
+    connect(this, &QWaylandSurface::windowPropertyChanged,
+            d->windowPropertyMap, &QQmlPropertyMap::insert);
+    connect(d->windowPropertyMap, &QQmlPropertyMap::valueChanged,
+            this, &QWaylandSurface::setWindowProperty);
+#endif
+}
+
+void QWaylandSurface::advanceBufferQueue()
+{
+    Q_D(const QWaylandSurface);
+    d->surface->advanceBufferQueue();
 }
 
 WaylandClient *QWaylandSurface::client() const
@@ -215,10 +234,21 @@ void QWaylandSurface::setSurfaceItem(QWaylandSurfaceItem *surfaceItem)
     Q_D(QWaylandSurface);
     d->surface_item = surfaceItem;
 }
+
+QObject *QWaylandSurface::windowPropertyMap() const
+{
+    Q_D(const QWaylandSurface);
+    return d->windowPropertyMap;
+}
+
 #endif //QT_COMPOSITOR_QUICK
 
 qint64 QWaylandSurface::processId() const
 {
+    Q_D(const QWaylandSurface);
+    if (d->surface->isDestroyed())
+        return -1;
+
     struct wl_client *client = static_cast<struct wl_client *>(this->client());
     pid_t pid;
     wl_client_get_credentials(client,&pid, 0,0);
@@ -349,6 +379,26 @@ void QWaylandSurface::destroySurfaceByForce()
     Q_D(QWaylandSurface);
    wl_resource *surface_resource = d->surface->resource()->handle;
    wl_resource_destroy(surface_resource);
+}
+
+void QWaylandSurface::ping()
+{
+    Q_D(QWaylandSurface);
+    if (d->surface->shellSurface())
+        d->surface->shellSurface()->ping();
+}
+
+/*!
+    Updates the surface with the compositor's clipboard selection. This is done automatically
+    when the surface receives keyboard focus, but it may be useful to call this function
+    manually when a surface requires clipboard updates without receiving focus.
+*/
+void QWaylandSurface::updateSelection()
+{
+    Q_D(QWaylandSurface);
+    QtWayland::InputDevice *inputDevice = d->surface->compositor()->defaultInputDevice();
+    if (inputDevice)
+        inputDevice->sendSelectionFocus(d->surface);
 }
 
 QT_END_NAMESPACE

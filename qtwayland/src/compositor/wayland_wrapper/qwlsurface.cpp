@@ -55,6 +55,7 @@
 
 #include <QtCore/QDebug>
 #include <QTouchEvent>
+#include <QtCore/QCoreApplication>
 
 #include <wayland-server.h>
 
@@ -85,8 +86,12 @@ Surface::Surface(struct wl_client *client, uint32_t id, Compositor *compositor)
     , m_shellSurface(0)
     , m_transientInactive(false)
     , m_isCursorSurface(false)
-    , m_textureIdBufferNeedsDisown(false)
-    , m_textureIdBuffer(0)
+    , m_visible(false)
+    , m_invertY(false)
+    , m_bufferType(QWaylandSurface::Invalid)
+    , m_surfaceWasDestroyed(false)
+    , m_deleteGuard(false)
+    , m_destroyed(false)
 {
     wl_list_init(&m_frame_callback_list);
     wl_list_init(&m_pending_frame_callback_list);
@@ -103,6 +108,22 @@ Surface::~Surface()
     }
 }
 
+void Surface::releaseSurfaces()
+{
+    delete m_waylandSurface;
+    m_waylandSurface = 0;
+    delete m_subSurface;
+    m_subSurface = 0;
+}
+
+void Surface::releaseFrontBuffer()
+{
+    if (m_frontBuffer && m_frontBuffer->waylandBufferHandle() && m_frontBuffer->isShmBuffer()) {
+        m_frontBuffer->disown();
+        m_frontBuffer = 0;
+    }
+}
+
 Surface *Surface::fromResource(struct ::wl_resource *resource)
 {
     return static_cast<Surface *>(Resource::fromResource(resource)->surface);
@@ -110,41 +131,58 @@ Surface *Surface::fromResource(struct ::wl_resource *resource)
 
 QWaylandSurface::Type Surface::type() const
 {
-    SurfaceBuffer *surfaceBuffer = currentSurfaceBuffer();
-    if (surfaceBuffer && surfaceBuffer->waylandBufferHandle()) {
-        if (surfaceBuffer->isShmBuffer()) {
-            return QWaylandSurface::Shm;
-        } else {
-            return QWaylandSurface::Texture;
-        }
-    }
-    return QWaylandSurface::Invalid;
+    return m_bufferType;
 }
 
 bool Surface::isYInverted() const
 {
-    bool ret = false;
     static bool negateReturn = qgetenv("QT_COMPOSITOR_NEGATE_INVERTED_Y").toInt();
-    QWaylandGraphicsHardwareIntegration *graphicsHWIntegration = m_compositor->graphicsHWIntegration();
+    return m_invertY != negateReturn;
+}
 
-#ifdef QT_COMPOSITOR_WAYLAND_GL
-    SurfaceBuffer *surfacebuffer = currentSurfaceBuffer();
-    if (!surfacebuffer) {
-        ret = false;
-    } else if (graphicsHWIntegration && surfacebuffer->waylandBufferHandle() && type() != QWaylandSurface::Shm) {
-        ret = graphicsHWIntegration->isYInverted(surfacebuffer->waylandBufferHandle());
-    } else
-#endif
-        ret = true;
-
-    return ret != negateReturn;
+/*
+ * When the compositor goes of screen, we want to release as much as
+ * possible, but we retain one buffer so we have something to
+ * represent the client when compositor comes back. This buffer is set
+ * as the backbuffer (similar to what we do in surface_commit below).
+ *
+ * For hardware buffers, we retain the front buffer because we are not
+ * on the render thread and we don't have GL to release. This applies
+ * to QtQuick only, but is generalized for simplicity. This means that
+ * a client which renders with only two hardware buffers will
+ * potentially have both those buffers in the compositor when it goes
+ * off screen and the client can thus be blocked. Qt clients use 3
+ * buffers though, so this is not a problem in practice.
+ *
+ * For SHM buffers, the memory is already bound as a texture so we can
+ * release it regardless. That means that SHM clients are ok with only
+ * 2 buffers.
+ */
+void Surface::setCompositorVisible(bool visible)
+{
+    if (!visible) {
+        if (m_bufferQueue.size() > 0) {
+            // If there are buffers in the queue, cycle through them
+            // and set the last one as backbuffer. Release all others.
+            if (m_backBuffer)
+                m_backBuffer->disown();
+            while (m_bufferQueue.size() > 1)
+                m_bufferQueue.takeFirst()->disown();
+            setBackBuffer(m_bufferQueue.takeLast());
+            Q_ASSERT(m_bufferQueue.isEmpty());
+        }
+        if (m_frontBuffer && type() == QWaylandSurface::Shm) {
+            // Release front shm buffer.
+            m_frontBuffer->disown();
+            m_frontBuffer = 0;
+        }
+        sendFrameCallback();
+    }
 }
 
 bool Surface::visible() const
 {
-
-    SurfaceBuffer *surfacebuffer = currentSurfaceBuffer();
-    return surfacebuffer->waylandBufferHandle();
+    return m_visible;
 }
 
 QPointF Surface::pos() const
@@ -195,58 +233,27 @@ QRegion Surface::opaqueRegion() const
 
 QImage Surface::image() const
 {
-    SurfaceBuffer *surfacebuffer = currentSurfaceBuffer();
-    if (surfacebuffer && !surfacebuffer->isDestroyed() && type() == QWaylandSurface::Shm) {
-        return surfacebuffer->image();
-    }
+    if (m_frontBuffer && !m_frontBuffer->isDestroyed() && m_bufferType == QWaylandSurface::Shm)
+        return m_frontBuffer->image();
     return QImage();
 }
 
 #ifdef QT_COMPOSITOR_WAYLAND_GL
 GLuint Surface::textureId(QOpenGLContext *context) const
 {
-    const SurfaceBuffer *surfacebuffer = currentSurfaceBuffer();
+    const SurfaceBuffer *surfacebuffer = m_frontBuffer;
 
     if (m_compositor->graphicsHWIntegration() && type() == QWaylandSurface::Texture
          && !surfacebuffer->textureCreated()) {
         QWaylandGraphicsHardwareIntegration *hwIntegration = m_compositor->graphicsHWIntegration();
         const_cast<SurfaceBuffer *>(surfacebuffer)->createTexture(hwIntegration,context);
     }
-
-    if (m_textureIdBufferNeedsDisown) {
-        Q_ASSERT(m_textureIdBuffer);
-        const_cast<SurfaceBuffer *>(m_textureIdBuffer)->disown();
-        m_textureIdBufferNeedsDisown = false;
-    }
-    m_textureIdBuffer = surfacebuffer;
-
     return surfacebuffer->texture();
 }
 #endif // QT_COMPOSITOR_WAYLAND_GL
 
 void Surface::sendFrameCallback()
 {
-    SurfaceBuffer *surfaceBuffer = currentSurfaceBuffer();
-    if (surfaceBuffer)
-        surfaceBuffer->setDisplayed();
-
-    if (m_backBuffer) {
-        if (m_frontBuffer) {
-#ifdef QT_COMPOSITOR_WAYLAND_GL
-            if (m_textureIdBuffer == m_frontBuffer) {
-                m_textureIdBufferNeedsDisown = true;
-            } else {
-#endif
-                m_frontBuffer->disown();
-#ifdef QT_COMPOSITOR_WAYLAND_GL
-            }
-#endif
-        }
-        m_frontBuffer = m_backBuffer;
-    }
-
-    bool updateNeeded = advanceBufferQueue();
-
     uint time = Compositor::currentTimeMsecs();
     struct wl_resource *frame_callback, *next;
     wl_list_for_each_safe(frame_callback, next, &m_frame_callback_list, link) {
@@ -254,9 +261,6 @@ void Surface::sendFrameCallback()
         wl_resource_destroy(frame_callback);
     }
     wl_list_init(&m_frame_callback_list);
-
-    if (updateNeeded)
-        doUpdate();
 }
 
 void Surface::frameFinished()
@@ -311,69 +315,108 @@ Compositor *Surface::compositor() const
     return m_compositor;
 }
 
-bool Surface::advanceBufferQueue()
+/*
+ * This little curveball is here to prevent the surface from
+ * being deleted while there are queued connections pending from
+ * QWaylandSurface which have yet to be delivered to receivers on
+ * the GUI thread.
+ *
+ * There is a slight chance that a surface_destroy_resource
+ * comes on the GUI thread and enters the GUI thread's event queue
+ * during the sync phase, before queued connections from
+ * 'sizeChanged', 'mapped' and 'unmapped' which are fired
+ * during advanceBufferQueue.
+ *
+ * The delete guard is here to delay the destruction until after
+ * these queued connections have been properly delivered. This
+ * is done by posting an event at the very end of
+ * advanceBufferQueue(). Once this has been delivered on the GUI
+ * thread, it is safe to delete again. Though ugly, the delay and
+ * overhead is minimal.
+ */
+void Surface::enterDeleteGuard()
 {
-    //has current buffer been displayed,
-    //do we have another buffer in the queue
-    //and does it have a valid damage rect
-
-    if (m_backBuffer && !m_backBuffer->isDisplayed())
-        return true;
-    if (m_bufferQueue.size()) {
-        QSize size;
-        if (m_backBuffer && m_backBuffer->waylandBufferHandle()) {
-            size = m_backBuffer->size();
-        }
-
-        if (!m_bufferQueue.first()->isComitted())
-            return false;
-
-        m_backBuffer = m_bufferQueue.takeFirst();
-        while (m_backBuffer && m_backBuffer->isDestroyed()) {
-            m_backBuffer->disown();
-            m_backBuffer = m_bufferQueue.size() ? m_bufferQueue.takeFirst() : 0;
-        }
-
-        if (!m_backBuffer)
-            return false; //we have no new backbuffer;
-
-        if (m_backBuffer->waylandBufferHandle()) {
-            size = m_backBuffer->size();
-        }
-        setSize(size);
-
-
-        if (m_backBuffer &&  (!m_subSurface || !m_subSurface->parent()) && !m_surfaceMapped) {
-            m_surfaceMapped = true;
-            emit m_waylandSurface->mapped();
-        } else if (m_backBuffer && !m_backBuffer->waylandBufferHandle() && m_surfaceMapped) {
-            m_surfaceMapped = false;
-            emit m_waylandSurface->unmapped();
-        }
-
-    } else {
-        m_backBuffer = 0;
-        return false;
-    }
-
-    return true;
+    m_deleteGuard = true;
+    QCoreApplication::postEvent(m_compositor, new DeleteGuard(this));
 }
 
-void Surface::doUpdate() {
-    if (postBuffer()) {
-#ifdef QT_COMPOSITOR_QUICK
-        QWaylandSurfaceItem *surfaceItem = waylandSurface()->surfaceItem();
-        if (surfaceItem)
-            surfaceItem->setDamagedFlag(true); // avoid flicker when we switch back to composited mode
-#endif
-        sendFrameCallback();
-    } else {
-        SurfaceBuffer *surfaceBuffer = currentSurfaceBuffer();
-        if (surfaceBuffer && surfaceBuffer->damageRect().isValid()) {
-            emit m_waylandSurface->damaged(surfaceBuffer->damageRect());
-        } else {
-            sendFrameCallback();
+void Surface::leaveDeleteGuard()
+{
+    if (m_surfaceWasDestroyed)
+        m_compositor->destroySurface(this);
+    m_deleteGuard = false;
+}
+
+void Surface::advanceBufferQueue()
+ {
+    SurfaceBuffer *front = m_frontBuffer;
+
+    // Advance current back buffer to the front buffer.
+    if (m_backBuffer) {
+        if (m_backBuffer->isDestroyed()) {
+            m_backBuffer->disown();
+            m_backBuffer = 0;
+         }
+        m_frontBuffer = m_backBuffer;
+        m_backBuffer = 0;
+    }
+
+    // Set a new back buffer if there is something in the queue.
+    if (m_bufferQueue.size() && m_bufferQueue.first()->isComitted()) {
+        SurfaceBuffer *next = m_bufferQueue.takeFirst();
+        while (next && next->isDestroyed()) {
+            next->disown();
+            next = m_bufferQueue.size() ? m_bufferQueue.takeFirst() : 0;
         }
+        setBackBuffer(next);
+    }
+
+    // Release the old front buffer if we changed it.
+    if (front && front != m_frontBuffer)
+        front->disown();
+
+    enterDeleteGuard();
+}
+
+/*!
+ * Sets the backbuffer for this surface. The back buffer is not yet on
+ * screen and will become live during the next advanceBufferQueue().
+ *
+ * The backbuffer represents the current state of the surface for the
+ * purpose of GUI-thread accessible properties such as size and visibility.
+ */
+void Surface::setBackBuffer(SurfaceBuffer *buffer)
+{
+    m_backBuffer = buffer;
+
+    if (m_backBuffer) {
+        m_visible = m_backBuffer->waylandBufferHandle() != 0;
+        QWaylandGraphicsHardwareIntegration *hwi = m_compositor->graphicsHWIntegration();
+        m_invertY = m_visible && (buffer->isShmBuffer() || (hwi && hwi->isYInverted(buffer->waylandBufferHandle())));
+        m_bufferType = m_visible ? (buffer->isShmBuffer() ? QWaylandSurface::Shm : QWaylandSurface::Texture) : QWaylandSurface::Invalid;
+
+        setSize(m_visible ? m_backBuffer->size() : QSize());
+
+        if ((!m_subSurface || !m_subSurface->parent()) && !m_surfaceMapped) {
+             m_surfaceMapped = true;
+             emit m_waylandSurface->mapped();
+        } else if (!m_visible && m_surfaceMapped) {
+             m_surfaceMapped = false;
+             emit m_waylandSurface->unmapped();
+        }
+
+        m_compositor->markSurfaceAsDirty(this);
+        emit m_waylandSurface->damaged(m_backBuffer->damageRect());
+    } else {
+        m_visible = false;
+        m_invertY = false;
+        m_bufferType = QWaylandSurface::Invalid;
+
+        InputDevice *inputDevice = m_compositor->defaultInputDevice();
+        if (inputDevice->keyboardFocus() == this)
+            inputDevice->setKeyboardFocus(0);
+        if (inputDevice->mouseFocus() == this)
+            inputDevice->setMouseFocus(0, QPointF(), QPointF());
     }
 }
 
@@ -399,27 +442,6 @@ SurfaceBuffer *Surface::createSurfaceBuffer(struct ::wl_resource *buffer)
     return newBuffer;
 }
 
-bool Surface::postBuffer() {
-#ifdef QT_COMPOSITOR_WAYLAND_GL
-    if (m_waylandSurface->handle() == m_compositor->directRenderSurface()) {
-        SurfaceBuffer *surfaceBuffer = currentSurfaceBuffer();
-        if (surfaceBuffer && surfaceBuffer->waylandBufferHandle()) {
-            if (m_compositor->pageFlipper()) {
-                if (m_compositor->pageFlipper()->displayBuffer(surfaceBuffer)) {
-                    surfaceBuffer->setPageFlipperHasBuffer(true);
-                    m_compositor->setDirectRenderingActive(true);
-                    return true;
-                } else {
-                    if (QT_WAYLAND_PRINT_BUFFERING_WARNINGS)
-                        qWarning() << "could not post buffer";
-                }
-            }
-        }
-    }
-#endif
-    return false;
-}
-
 void Surface::attach(struct ::wl_resource *buffer)
 {
     SurfaceBuffer *last = m_bufferQueue.size()?m_bufferQueue.last():0;
@@ -437,14 +459,6 @@ void Surface::attach(struct ::wl_resource *buffer)
 
     SurfaceBuffer *surfBuf = createSurfaceBuffer(buffer);
     m_bufferQueue << surfBuf;
-
-    if (!buffer) {
-        InputDevice *inputDevice = m_compositor->defaultInputDevice();
-        if (inputDevice->keyboardFocus() == this)
-            inputDevice->setKeyboardFocus(0);
-        if (inputDevice->mouseFocus() == this)
-            inputDevice->setMouseFocus(0, QPointF(), QPointF());
-    }
 }
 
 void Surface::damage(const QRect &rect)
@@ -467,8 +481,16 @@ void Surface::damage(const QRect &rect)
 
 void Surface::surface_destroy_resource(Resource *)
 {
-    compositor()->surfaceDestroyed(this);
-    delete this;
+    m_destroyed = true;
+    if (m_extendedSurface) {
+        if (m_extendedSurface->resource())
+            wl_resource_destroy(m_extendedSurface->resource()->handle);
+        m_extendedSurface = 0;
+    }
+    if (m_deleteGuard)
+        m_surfaceWasDestroyed = true;
+    else
+        compositor()->destroySurface(this);
 }
 
 void Surface::surface_destroy(Resource *resource)
@@ -530,10 +552,26 @@ void Surface::surface_commit(Resource *)
         } else {
             surfaceBuffer->setCommitted();
         }
-        advanceBufferQueue();
     }
 
-    doUpdate();
+    if (compositor() && compositor()->window() && !compositor()->window()->isVisible()) {
+        if (m_backBuffer)
+            m_backBuffer->disown();
+        while (m_bufferQueue.size() > 1) // keep the last buffer to have something to show.
+            m_bufferQueue.takeFirst()->disown();
+        setBackBuffer(surfaceBuffer);
+        m_bufferQueue.clear();
+        sendFrameCallback();
+        return;
+    }
+
+    // A new buffer was added to the queue, so we set it as the current
+    // back buffer. Second and third buffers, if the come, will be handled
+    // in advanceBufferQueue().
+    if (!m_backBuffer && m_bufferQueue.size() == 1) {
+        setBackBuffer(surfaceBuffer);
+        m_bufferQueue.takeFirst();
+    }
 }
 
 void Surface::setClassName(const QString &className)

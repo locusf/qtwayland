@@ -72,11 +72,14 @@ QWaylandWindow::QWaylandWindow(QWindow *window)
     , mWindowDecoration(0)
     , mMouseEventsInContentArea(false)
     , mMousePressedInContentArea(Qt::NoButton)
+    , m_cursorShape(Qt::ArrowCursor)
     , mBuffer(0)
     , mWaitingForFrameSync(false)
     , mFrameCallback(0)
     , mRequestResizeSent(false)
     , mCanResize(true)
+    , mResizeDirty(false)
+    , mResizeAfterSwap(!qEnvironmentVariableIsSet("QT_WAYLAND_RESIZE_AFTER_SWAP"))
     , mSentInitialResize(false)
     , mMouseDevice(0)
     , mMouseSerial(0)
@@ -95,6 +98,9 @@ QWaylandWindow::QWaylandWindow(QWindow *window)
         mSubSurfaceWindow = new QWaylandSubSurface(this, mDisplay->subSurfaceExtension()->get_sub_surface_aware_surface(object()));
 
     if (mShellSurface) {
+        // Set initial surface title
+        mShellSurface->set_title(window->title());
+
         // Set surface class to the .desktop file name (obtained from executable name)
         QFileInfo exeFileInfo(qApp->applicationFilePath());
         QString className = exeFileInfo.baseName() + QLatin1String(".desktop");
@@ -114,6 +120,7 @@ QWaylandWindow::QWaylandWindow(QWindow *window)
     setWindowFlags(window->flags());
     setGeometry(window->geometry());
     setWindowState(window->windowState());
+    handleContentOrientationChange(window->contentOrientation());
 }
 
 QWaylandWindow::~QWaylandWindow()
@@ -185,10 +192,11 @@ void QWaylandWindow::setGeometry(const QRect &rect)
     if (mWindowDecoration && window()->isVisible())
         mWindowDecoration->update();
 
-    if (mConfigure.isEmpty()) {
+    if (mResizeAfterSwap)
+        mResizeDirty = true;
+    else
         QWindowSystemInterface::handleGeometryChange(window(), geometry());
-        QWindowSystemInterface::handleExposeEvent(window(), QRegion(geometry()));
-    }
+    QWindowSystemInterface::handleExposeEvent(window(), QRegion(geometry()));
 }
 
 void QWaylandWindow::setVisible(bool visible)
@@ -280,7 +288,6 @@ void QWaylandWindow::doResize()
     setGeometry(geometry);
 
     mConfigure.clear();
-    QWindowSystemInterface::handleGeometryChange(window(), geometry);
 }
 
 void QWaylandWindow::setCanResize(bool canResize)
@@ -288,9 +295,17 @@ void QWaylandWindow::setCanResize(bool canResize)
     QMutexLocker lock(&mResizeLock);
     mCanResize = canResize;
 
-    if (canResize && !mConfigure.isEmpty()) {
-        doResize();
-        QWindowSystemInterface::handleExposeEvent(window(), geometry());
+    if (canResize) {
+        if (mResizeDirty) {
+            QWindowSystemInterface::handleGeometryChange(window(), geometry());
+        }
+        if (!mConfigure.isEmpty()) {
+            doResize();
+            QWindowSystemInterface::handleExposeEvent(window(), geometry());
+        } else if (mResizeDirty) {
+            QWindowSystemInterface::handleExposeEvent(window(), geometry());
+            mResizeDirty = false;
+        }
     }
 }
 
@@ -579,6 +594,12 @@ void QWaylandWindow::setMouseCursor(QWaylandInputDevice *device, Qt::CursorShape
 void QWaylandWindow::restoreMouseCursor(QWaylandInputDevice *device)
 {
     setMouseCursor(device, window()->cursor().shape());
+}
+
+void QWaylandWindow::requestActivateWindow()
+{
+    // no-op. Wayland does not have activation protocol,
+    // we rely on compositor setting keyboard focus based on window stacking.
 }
 
 QT_END_NAMESPACE

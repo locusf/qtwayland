@@ -140,6 +140,11 @@ QWindow * QWaylandCompositor::window() const
     return m_toplevel_window;
 }
 
+void QWaylandCompositor::cleanupGraphicsResources()
+{
+    m_compositor->cleanupGraphicsResources();
+}
+
 void QWaylandCompositor::surfaceAboutToBeDestroyed(QWaylandSurface *surface)
 {
     Q_UNUSED(surface);
@@ -250,7 +255,6 @@ void QWaylandCompositor::setCursorSurface(QWaylandSurface *surface, int hotspotX
     Q_UNUSED(surface);
     Q_UNUSED(hotspotX);
     Q_UNUSED(hotspotY);
-    qDebug() << "changeCursor" << surface->size() << hotspotX << hotspotY;
 }
 
 void QWaylandCompositor::enableSubSurfaceExtension()

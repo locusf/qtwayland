@@ -90,7 +90,7 @@ void QWaylandEglWindow::setGeometry(const QRect &rect)
 
     createDecoration();
     QMargins margins = frameMargins();
-    QSize sizeWithMargins = geometry().size() + QSize(margins.left() + margins.right(), margins.top() + margins.bottom());
+    QSize sizeWithMargins = rect.size() + QSize(margins.left() + margins.right(), margins.top() + margins.bottom());
 
     if (m_waylandEglWindow) {
         int current_width, current_height;
@@ -100,15 +100,6 @@ void QWaylandEglWindow::setGeometry(const QRect &rect)
             mOffset = QPoint();
 
             m_resize = true;
-
-            /* Destroy the surface; safer than to expect the EGL implementation to resize
-             * Some EGL implementations seem to have caching strategies that don't work right
-             * wrt resizes.
-             */
-            if (m_eglSurface) {
-                eglDestroySurface(m_eglIntegration->eglDisplay(), m_eglSurface);
-                m_eglSurface = 0;
-            }
         }
     } else {
         m_waylandEglWindow = wl_egl_window_create(object(), sizeWithMargins.width(), sizeWithMargins.height());

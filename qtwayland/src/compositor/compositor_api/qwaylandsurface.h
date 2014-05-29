@@ -81,6 +81,9 @@ class Q_COMPOSITOR_EXPORT QWaylandSurface : public QObject
     Q_PROPERTY(QString title READ title NOTIFY titleChanged)
     Q_PROPERTY(Qt::ScreenOrientations orientationUpdateMask READ orientationUpdateMask NOTIFY orientationUpdateMaskChanged)
     Q_PROPERTY(QWindow::Visibility visibility READ visibility WRITE setVisibility NOTIFY visibilityChanged)
+#ifdef QT_COMPOSITOR_QUICK
+    Q_PROPERTY(QObject * windowProperties READ windowPropertyMap CONSTANT)
+#endif
 
     Q_ENUMS(WindowFlag)
     Q_FLAGS(WindowFlag WindowFlags)
@@ -88,7 +91,8 @@ class Q_COMPOSITOR_EXPORT QWaylandSurface : public QObject
 public:
     enum WindowFlag {
         OverridesSystemGestures     = 0x0001,
-        StaysOnTop                  = 0x0002
+        StaysOnTop                  = 0x0002,
+        BypassWindowManager         = 0x0004
     };
     Q_DECLARE_FLAGS(WindowFlags, WindowFlag)
 
@@ -140,6 +144,8 @@ public:
 #ifdef QT_COMPOSITOR_QUICK
     QWaylandSurfaceItem *surfaceItem() const;
     void setSurfaceItem(QWaylandSurfaceItem *surfaceItem);
+
+    QObject *windowPropertyMap() const;
 #endif
 
     qint64 processId() const;
@@ -162,6 +168,13 @@ public:
 
     Q_INVOKABLE void destroySurface();
     Q_INVOKABLE void destroySurfaceByForce();
+    Q_INVOKABLE void ping();
+
+    void advanceBufferQueue();
+
+public slots:
+    void updateSelection();
+
 signals:
     void mapped();
     void unmapped();
@@ -179,6 +192,7 @@ signals:
     void raiseRequested();
     void lowerRequested();
     void visibilityChanged();
+    void pong();
 };
 
 QT_END_NAMESPACE

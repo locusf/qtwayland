@@ -77,6 +77,13 @@ class ShellSurface;
 class Q_COMPOSITOR_EXPORT Surface : public QtWaylandServer::wl_surface
 {
 public:
+
+    class DeleteGuard : public QEvent {
+    public:
+        DeleteGuard(Surface *s) : QEvent(User), surface(s) { }
+        Surface *surface;
+    };
+
     Surface(struct wl_client *client, uint32_t id, Compositor *compositor);
     ~Surface();
 
@@ -136,6 +143,17 @@ public:
     bool isCursorSurface() const { return m_isCursorSurface; }
     void setCursorSurface(bool isCursor) { m_isCursorSurface = isCursor; }
 
+    void advanceBufferQueue();
+    void releaseSurfaces();
+    void releaseFrontBuffer();
+    bool isFrontBufferReleased() const { return m_visible && !m_frontBuffer; }
+
+    void enterDeleteGuard();
+    void leaveDeleteGuard();
+    inline bool isDestroyed() const { return m_destroyed; }
+
+    void setCompositorVisible(bool visible);
+
 private:
     Q_DISABLE_COPY(Surface)
 
@@ -169,18 +187,17 @@ private:
     bool m_transientInactive;
     bool m_isCursorSurface;
 
-#ifdef QT_COMPOSITOR_WAYLAND_GL
-    mutable bool m_textureIdBufferNeedsDisown;
-    mutable const SurfaceBuffer *m_textureIdBuffer;
-#endif
+    bool m_visible;
+    bool m_invertY;
+    QWaylandSurface::Type m_bufferType;
 
-    inline SurfaceBuffer *currentSurfaceBuffer() const;
+    bool m_surfaceWasDestroyed;
+    bool m_deleteGuard;
+    bool m_destroyed;
+
     void damage(const QRect &rect);
-    bool advanceBufferQueue();
-    void doUpdate();
+    void setBackBuffer(SurfaceBuffer *buffer);
     SurfaceBuffer *createSurfaceBuffer(struct ::wl_resource *buffer);
-    void frameFinishedInternal();
-    bool postBuffer();
 
     void attach(struct ::wl_resource *buffer);
 
@@ -200,10 +217,6 @@ private:
     void surface_commit(Resource *resource) Q_DECL_OVERRIDE;
 
 };
-
-inline SurfaceBuffer *Surface::currentSurfaceBuffer() const {
-    return m_backBuffer? m_backBuffer : m_frontBuffer;
-}
 
 }
 

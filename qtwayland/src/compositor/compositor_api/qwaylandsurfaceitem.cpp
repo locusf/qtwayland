@@ -126,7 +126,6 @@ void QWaylandSurfaceItem::init(QWaylandSurface *surface)
 
     m_surface = surface;
     m_surface->setSurfaceItem(this);
-    m_surface->sendOnScreenVisibilityChange(m_clientRenderingEnabled);
 
     if (m_resizeSurfaceToItem) {
         updateSurfaceSize();
@@ -367,11 +366,14 @@ void QWaylandSurfaceItem::updateTexture()
                 opt |= QQuickWindow::TextureHasAlphaChannel;
             }
             texture = window()->createTextureFromId(m_surface->texture(context), m_surface->size(), opt);
-        } else {
+            texture->bind();
+            delete oldTexture;
+        } else if (m_surface->type() == QWaylandSurface::Shm && !m_surface->handle()->isFrontBufferReleased()){
             texture = window()->createTextureFromImage(m_surface->image());
+            texture->bind();
+            m_surface->handle()->releaseFrontBuffer();
+            delete oldTexture;
         }
-        texture->bind();
-        delete oldTexture;
     }
 
     m_provider->t = texture;
@@ -386,8 +388,16 @@ QSGNode *QWaylandSurfaceItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
         return 0;
     }
 
-    updateTexture();
-    if (!m_provider->t || !m_paintEnabled) {
+    bool invertY = surface()->isYInverted();
+
+    // Order here is important, as the state of visible is that of the pending
+    // buffer but will be replaced after we advance the buffer queue.
+    bool visible = m_surface->visible();
+    surface()->advanceBufferQueue();
+    if (visible)
+        updateTexture();
+
+    if (!visible || !m_provider->t || !m_paintEnabled) {
         delete oldNode;
         return 0;
     }
@@ -400,7 +410,7 @@ QSGNode *QWaylandSurfaceItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
 
     node->updateTexture();
 
-    if (surface()->isYInverted()) {
+    if (invertY) {
         node->setRect(0, height(), width(), -height());
     } else {
         node->setRect(0, 0, width(), height());

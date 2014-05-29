@@ -68,6 +68,10 @@
 #include <QtCore/QAbstractEventDispatcher>
 #include <QtGui/private/qguiapplication_p.h>
 
+#ifdef QT_COMPOSITOR_QUICK
+#include <QtQuick/QQuickWindow>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,8 +109,6 @@ void compositor_create_region(struct wl_client *client,
     Q_UNUSED(compositor);
     new Region(client, id);
 }
-
-static bool compositor_no_throttle = false;
 
 const static struct wl_compositor_interface compositor_interface = {
     compositor_create_surface,
@@ -171,13 +173,6 @@ Compositor::Compositor(QWaylandCompositor *qt_compositor)
 
     }
 #endif
-    // Set QT_WAYLAND_COMPOSITOR_NO_THROTTLE to send frame events to
-    // all "dirty" surfaces regardless of compositor trying to throttle
-    // non-visible client surfaces
-    QByteArray throttleEnv = qgetenv("QT_WAYLAND_COMPOSITOR_NO_THROTTLE");
-    if (!throttleEnv.isEmpty() && throttleEnv != "0" && throttleEnv != "false")
-        compositor_no_throttle = true;
-
     m_windowManagerIntegration = new WindowManagerServerIntegration(qt_compositor, this);
 
     wl_display_add_global(m_display->handle(),&wl_compositor_interface,this,Compositor::bind_func);
@@ -213,6 +208,20 @@ Compositor::Compositor(QWaylandCompositor *qt_compositor)
 
     qRegisterMetaType<SurfaceBuffer*>("SurfaceBuffer*");
     //initialize distancefieldglyphcache here
+
+    if (window)
+        connect(window, SIGNAL(visibleChanged(bool)), this, SLOT(visibilityChanged(bool)));
+
+#ifdef QT_COMPOSITOR_QUICK
+    if (QQuickWindow *w = qobject_cast<QQuickWindow *>(window)) {
+        connect(w, SIGNAL(beforeSynchronizing()), this, SLOT(cleanupGraphicsResources()), Qt::DirectConnection);
+    } else
+#endif
+    {
+#if !defined(QT_NO_DEBUG) && !defined(QT_WAYLAND_NO_CLEANUP_WARNING)
+        qWarning("QWaylandCompositor::cleanupGraphicsResources() must be called manually");
+#endif
+    }
 }
 
 Compositor::~Compositor()
@@ -234,23 +243,22 @@ Compositor::~Compositor()
     delete m_display;
 }
 
+void Compositor::visibilityChanged(bool visible)
+{
+    foreach (Surface *s, m_surfaces)
+        s->setCompositorVisible(visible);
+}
+
 void Compositor::frameFinished(Surface *surface)
 {
-    if (compositor_no_throttle || !surface) {
-        QSet<Surface *> dirty = m_dirty_surfaces;
-        m_dirty_surfaces.clear();
-        int numDirty = 0;
-        foreach (Surface *dirtySurface, dirty) {
-            dirtySurface->sendFrameCallback();
-            if (surface && dirtySurface != surface)
-                numDirty++;
-        }
-        if (compositor_no_throttle && numDirty) {
-            qWarning() << Q_FUNC_INFO << "not throttling" << numDirty << "surfaces";
-        }
-    } else if (surface && m_dirty_surfaces.contains(surface)) {
+    if (surface && m_dirty_surfaces.contains(surface)) {
         m_dirty_surfaces.remove(surface);
         surface->sendFrameCallback();
+    } else if (!surface) {
+        QSet<Surface *> dirty = m_dirty_surfaces;
+        m_dirty_surfaces.clear();
+        foreach (Surface *surface, dirty)
+            surface->sendFrameCallback();
     }
 }
 
@@ -273,11 +281,6 @@ uint Compositor::currentTimeMsecs()
     return 0;
 }
 
-void Compositor::releaseBuffer(QPlatformScreenBuffer *screenBuffer)
-{
-    static_cast<SurfaceBuffer *>(screenBuffer)->scheduledRelease();
-}
-
 void Compositor::processWaylandEvents()
 {
     int ret = wl_event_loop_dispatch(m_loop, 0);
@@ -286,28 +289,36 @@ void Compositor::processWaylandEvents()
     wl_display_flush_clients(m_display->handle());
 }
 
-void Compositor::surfaceDestroyed(Surface *surface)
+void Compositor::destroySurface(Surface *surface)
 {
-    InputDevice *dev = defaultInputDevice();
-    if (dev->mouseFocus() == surface) {
-        dev->setMouseFocus(0, QPointF(), QPointF());
-        // Make sure the surface is reset regardless of what the grabber
-        // interface's focus() does. (e.g. the default implementation does
-        // nothing when a button is down which would be disastrous here)
-        dev->pointerDevice()->setFocus(0, QPointF());
-    }
-    if (dev->pointerDevice()->current() == surface) {
-        dev->pointerDevice()->setCurrent(0, QPointF());
-    }
-    if (dev->keyboardFocus() == surface)
-        dev->setKeyboardFocus(0);
-
     m_surfaces.removeOne(surface);
     m_dirty_surfaces.remove(surface);
     if (m_directRenderSurface == surface)
         setDirectRenderSurface(0, 0);
 
     waylandCompositor()->surfaceAboutToBeDestroyed(surface->waylandSurface());
+
+    surface->releaseSurfaces();
+    m_destroyed_surfaces << surface;
+}
+
+void Compositor::cleanupGraphicsResources()
+{
+    foreach (SurfaceBuffer *s, m_destroyed_buffers)
+        s->bufferWasDestroyed();
+    m_destroyed_buffers.clear();
+
+    qDeleteAll(m_destroyed_surfaces);
+    m_destroyed_surfaces.clear();
+}
+
+bool Compositor::event(QEvent *e)
+{
+    if (e->type() == QEvent::User) {
+        static_cast<Surface::DeleteGuard *>(e)->surface->leaveDeleteGuard();
+        return true;
+    }
+    return QObject::event(e);
 }
 
 void Compositor::markSurfaceAsDirty(QtWayland::Surface *surface)
@@ -425,8 +436,7 @@ void Compositor::setScreenOrientation(Qt::ScreenOrientation orientation)
     for (int i = 0; i < clientList.length(); ++i) {
         struct wl_client *client = clientList.at(i);
         Output *output = m_output_global->outputForClient(client);
-        Q_ASSERT(output);
-        if (output->extendedOutput)
+        if (output && output->extendedOutput)
             output->extendedOutput->sendOutputOrientation(orientation);
     }
 }

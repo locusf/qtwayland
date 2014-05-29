@@ -136,6 +136,8 @@ public:
     void raise() Q_DECL_OVERRIDE;
     void lower() Q_DECL_OVERRIDE;
 
+    void requestActivateWindow();
+
     QWaylandDecoration *decoration() const;
     void setDecoration(QWaylandDecoration *decoration);
 
@@ -187,6 +189,8 @@ protected:
     QWaylandWindowConfigure mConfigure;
     bool mRequestResizeSent;
     bool mCanResize;
+    bool mResizeDirty;
+    bool mResizeAfterSwap;
 
     bool mSentInitialResize;
     QPoint mOffset;

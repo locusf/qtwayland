@@ -65,6 +65,7 @@ ExtendedSurface::ExtendedSurface(struct wl_client *client, uint32_t id, Surface 
     , m_surface(surface)
     , m_contentOrientation(Qt::PrimaryOrientation)
     , m_windowFlags(0)
+    , m_visibility(QWindow::Hidden)
 {
     Q_ASSERT(surface->extendedSurface() == 0);
     surface->setExtendedSurface(this);
@@ -72,6 +73,7 @@ ExtendedSurface::ExtendedSurface(struct wl_client *client, uint32_t id, Surface 
 
 ExtendedSurface::~ExtendedSurface()
 {
+    m_surface->setExtendedSurface(0);
 }
 
 void ExtendedSurface::sendGenericProperty(const QString &name, const QVariant &variant)
